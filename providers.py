@@ -1,8 +1,19 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+from pathlib import Path
 import urllib.error
 import urllib.request
+
+_ENV_FILE = Path(__file__).resolve().parent / '.env'
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text(encoding='utf-8').splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith('#') and '=' in _line:
+            if _line.startswith('export '):
+                _line = _line[7:].strip()
+            _k, _v = _line.split('=', 1)
+            os.environ[_k.strip()] = _v.strip().strip('"').strip("'")
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
@@ -12,16 +23,45 @@ CONFIG = {
 }
 
 
+_LAST_CALL_TS = 0.0
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    import time
+    global _LAST_CALL_TS
+    is_gemini = 'generativelanguage.googleapis.com' in url and isinstance(payload, dict) and 'model' in payload
+    for attempt in range(15):
+        if is_gemini:
+            elapsed = time.monotonic() - _LAST_CALL_TS
+            if elapsed < 4.5:
+                time.sleep(4.5 - elapsed)
+            _LAST_CALL_TS = time.monotonic()
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            body = ''
+            try:
+                body = exc.read().decode('utf-8', 'ignore')
+            except Exception:
+                pass
+            if exc.code in (404, 429, 500, 502, 503, 504) and attempt < 14:
+                if is_gemini and ('GenerateRequestsPerDay' in body or exc.code == 404 or 'limit: 0' in body):
+                    time.sleep(1)
+                elif is_gemini and exc.code == 429:
+                    time.sleep(8)
+                elif is_gemini:
+                    time.sleep(3)
+                else:
+                    time.sleep(5)
+                continue
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < 14:
+                time.sleep(3)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {getattr(exc, "reason", exc)}') from exc
 
 
 class Provider:
